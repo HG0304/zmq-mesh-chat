@@ -1,0 +1,136 @@
+services:
+  broker:
+    build:
+      context: .
+      dockerfile: broker/Dockerfile
+    container_name: broker
+
+  py-server-1:
+    build:
+      context: .
+      dockerfile: python/Dockerfile
+    environment:
+      APP_MODE: server
+      SERVER_NAME: py-server-1
+      BROKER_BACKEND_ADDR: tcp://broker:5556
+      DB_PATH: /data/chat.db
+    volumes:
+      - py_server_1_data:/data
+    depends_on:
+      - broker
+
+  py-server-2:
+    build:
+      context: .
+      dockerfile: python/Dockerfile
+    environment:
+      APP_MODE: server
+      SERVER_NAME: py-server-2
+      BROKER_BACKEND_ADDR: tcp://broker:5556
+      DB_PATH: /data/chat.db
+    volumes:
+      - py_server_2_data:/data
+    depends_on:
+      - broker
+
+  java-server-1:
+    build:
+      context: .
+      dockerfile: java/Dockerfile
+    environment:
+      APP_MODE: server
+      SERVER_NAME: java-server-1
+      BROKER_BACKEND_ADDR: tcp://broker:5556
+      DB_PATH: /data/chat.db
+    volumes:
+      - java_server_1_data:/data
+    depends_on:
+      - broker
+
+  java-server-2:
+    build:
+      context: .
+      dockerfile: java/Dockerfile
+    environment:
+      APP_MODE: server
+      SERVER_NAME: java-server-2
+      BROKER_BACKEND_ADDR: tcp://broker:5556
+      DB_PATH: /data/chat.db
+    volumes:
+      - java_server_2_data:/data
+    depends_on:
+      - broker
+
+  py-client-1:
+    build:
+      context: .
+      dockerfile: python/Dockerfile
+    environment:
+      APP_MODE: client
+      CLIENT_NAME: py-client-1
+      USERNAME: py_user_1
+      CREATE_CHANNEL_NAME: PyCanalA
+      BROKER_FRONTEND_ADDR: tcp://broker:5555
+    depends_on:
+      - broker
+      - py-server-1
+      - py-server-2
+      - java-server-1
+      - java-server-2
+
+  py-client-2:
+    build:
+      context: .
+      dockerfile: python/Dockerfile
+    environment:
+      APP_MODE: client
+      CLIENT_NAME: py-client-2
+      USERNAME: py_user_2
+      CREATE_CHANNEL_NAME: PyCanalB
+      BROKER_FRONTEND_ADDR: tcp://broker:5555
+    depends_on:
+      - broker
+      - py-server-1
+      - py-server-2
+      - java-server-1
+      - java-server-2
+
+  java-client-1:
+    build:
+      context: .
+      dockerfile: java/Dockerfile
+    environment:
+      APP_MODE: client
+      CLIENT_NAME: java-client-1
+      USERNAME: java_user_1
+      CREATE_CHANNEL_NAME: JavaCanalA
+      BROKER_FRONTEND_ADDR: tcp://broker:5555
+    depends_on:
+      - broker
+      - py-server-1
+      - py-server-2
+      - java-server-1
+      - java-server-2
+
+  java-client-2:
+    build:
+      context: .
+      dockerfile: java/Dockerfile
+    environment:
+      APP_MODE: client
+      CLIENT_NAME: java-client-2
+      USERNAME: java_user_2
+      CREATE_CHANNEL_NAME: JavaCanalB
+      BROKER_FRONTEND_ADDR: tcp://broker:5555
+    depends_on:
+      - broker
+      - py-server-1
+      - py-server-2
+      - java-server-1
+      - java-server-2
+
+volumes:
+  py_server_1_data:
+  py_server_2_data:
+  java_server_1_data:
+  java_server_2_data:

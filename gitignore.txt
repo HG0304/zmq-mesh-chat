@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.pyc
+
+# Java / Maven
+java/target/
+
+# Local env
+.env
