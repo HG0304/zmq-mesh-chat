@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package meshchat;
+
+message LoginRequest {
+  string username = 1;
+}
+
+message LoginResponse {
+  string username = 1;
+}
+
+message CreateChannelRequest {
+  string channel_name = 1;
+  string requested_by = 2;
+}
+
+message CreateChannelResponse {
+  string channel_name = 1;
+}
+
+message ListChannelsRequest {}
+
+message ListChannelsResponse {
+  repeated string channels = 1;
+}
+
+message ClientRequest {
+  uint64 request_id = 1;
+  int64 timestamp_ms = 2;
+
+  oneof payload {
+    LoginRequest login = 10;
+    CreateChannelRequest create_channel = 11;
+    ListChannelsRequest list_channels = 12;
+  }
+}
+
+message ServerResponse {
+  uint64 request_id = 1;
+  int64 timestamp_ms = 2;
+  bool ok = 3;
+  string error_code = 4;
+  string error_message = 5;
+
+  oneof payload {
+    LoginResponse login = 10;
+    CreateChannelResponse create_channel = 11;
+    ListChannelsResponse list_channels = 12;
+  }
+}
