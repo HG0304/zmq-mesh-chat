@@ -25,6 +25,25 @@ message ListChannelsResponse {
   repeated string channels = 1;
 }
 
+message PublishInChannelRequest {
+  string channel_name = 1;
+  string message = 2;
+  string requested_by = 3;
+}
+
+message PublishInChannelResponse {
+  string channel_name = 1;
+  int64 published_timestamp_ms = 2;
+}
+
+message ChannelMessageEvent {
+  string channel_name = 1;
+  string message = 2;
+  string sent_by = 3;
+  int64 request_timestamp_ms = 4;
+  int64 published_timestamp_ms = 5;
+}
+
 message ClientRequest {
   uint64 request_id = 1;
   int64 timestamp_ms = 2;
@@ -33,6 +52,7 @@ message ClientRequest {
     LoginRequest login = 10;
     CreateChannelRequest create_channel = 11;
     ListChannelsRequest list_channels = 12;
+    PublishInChannelRequest publish_in_channel = 13;
   }
 }
 
@@ -47,5 +67,6 @@ message ServerResponse {
     LoginResponse login = 10;
     CreateChannelResponse create_channel = 11;
     ListChannelsResponse list_channels = 12;
+    PublishInChannelResponse publish_in_channel = 13;
   }
 }

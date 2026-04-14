@@ -37,6 +37,33 @@ class ChatDB:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS publications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel_name TEXT NOT NULL,
+                    message_text TEXT NOT NULL,
+                    sent_by TEXT NOT NULL,
+                    request_ts_ms INTEGER NOT NULL,
+                    published_ts_ms INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS request_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id INTEGER NOT NULL,
+                    operation TEXT NOT NULL,
+                    username TEXT,
+                    request_ts_ms INTEGER NOT NULL,
+                    handled_ts_ms INTEGER NOT NULL,
+                    ok INTEGER NOT NULL,
+                    error_code TEXT,
+                    details TEXT
+                )
+                """
+            )
             conn.commit()
 
     def register_login(self, username: str, ts_ms: int) -> None:
@@ -67,3 +94,63 @@ class ChatDB:
             cur = conn.cursor()
             cur.execute("SELECT name FROM channels ORDER BY name ASC")
             return [row["name"] for row in cur.fetchall()]
+
+    def channel_exists(self, channel_name: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM channels WHERE name = ?", (channel_name,))
+            return cur.fetchone() is not None
+
+    def save_publication(
+        self,
+        channel_name: str,
+        message_text: str,
+        sent_by: str,
+        request_ts_ms: int,
+        published_ts_ms: int,
+    ) -> int:
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO publications
+                    (channel_name, message_text, sent_by, request_ts_ms, published_ts_ms)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (channel_name, message_text, sent_by, request_ts_ms, published_ts_ms),
+                )
+                conn.commit()
+                return int(cur.lastrowid)
+
+    def log_request(
+        self,
+        request_id: int,
+        operation: str,
+        username: str,
+        request_ts_ms: int,
+        handled_ts_ms: int,
+        ok: bool,
+        error_code: str,
+        details: str,
+    ) -> None:
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO request_logs
+                    (request_id, operation, username, request_ts_ms, handled_ts_ms, ok, error_code, details)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        request_id,
+                        operation,
+                        username,
+                        request_ts_ms,
+                        handled_ts_ms,
+                        1 if ok else 0,
+                        error_code,
+                        details,
+                    ),
+                )
+                conn.commit()

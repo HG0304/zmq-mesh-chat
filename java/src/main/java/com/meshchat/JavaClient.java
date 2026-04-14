@@ -1,6 +1,10 @@
 package com.meshchat;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 
 import org.zeromq.SocketType;
@@ -14,14 +18,20 @@ public class JavaClient {
         String clientName = System.getenv().getOrDefault("CLIENT_NAME", "java-client");
         String username = System.getenv().getOrDefault("USERNAME", clientName);
         String frontendAddr = System.getenv().getOrDefault("BROKER_FRONTEND_ADDR", "tcp://broker:5555");
+        String pubsubXpubAddr = System.getenv().getOrDefault("PUBSUB_XPUB_ADDR", "tcp://pubsub-proxy:5558");
         String createChannelName = System.getenv().getOrDefault("CREATE_CHANNEL_NAME", username + "_ch");
 
         long requestId = ThreadLocalRandom.current().nextLong(1, 10_000);
+        Set<String> subscribedChannels = new HashSet<>();
 
         try (ZContext context = new ZContext()) {
-            ZMQ.Socket socket = context.createSocket(SocketType.REQ);
-            socket.connect(frontendAddr);
-            System.out.printf("[%s] connected frontend=%s username=%s%n", clientName, frontendAddr, username);
+            ZMQ.Socket reqSocket = context.createSocket(SocketType.REQ);
+            reqSocket.connect(frontendAddr);
+
+            ZMQ.Socket subSocket = context.createSocket(SocketType.SUB);
+            subSocket.connect(pubsubXpubAddr);
+
+            System.out.printf("[%s] connected frontend=%s pubsub_xpub=%s username=%s%n", clientName, frontendAddr, pubsubXpubAddr, username);
 
             while (!Thread.currentThread().isInterrupted()) {
                 requestId++;
@@ -30,36 +40,95 @@ public class JavaClient {
                     .setTimestampMs(nowMs())
                     .setLogin(Chat.LoginRequest.newBuilder().setUsername(username).build())
                     .build();
-                send(socket, clientName, loginReq);
-                Chat.ServerResponse loginRes = recv(socket, clientName);
-                if (!loginRes.getOk()) {
-                    sleep(5000);
-                    continue;
+                send(reqSocket, clientName, loginReq);
+                Chat.ServerResponse loginRes = recv(reqSocket, clientName);
+                if (loginRes.getOk()) {
+                    break;
                 }
+                sleep(5000);
+            }
 
-                requestId++;
-                Chat.ClientRequest createReq = Chat.ClientRequest.newBuilder()
-                    .setRequestId(requestId)
-                    .setTimestampMs(nowMs())
-                    .setCreateChannel(
-                        Chat.CreateChannelRequest.newBuilder()
-                            .setChannelName(createChannelName)
-                            .setRequestedBy(username)
-                            .build())
-                    .build();
-                send(socket, clientName, createReq);
-                recv(socket, clientName);
-
+            while (!Thread.currentThread().isInterrupted()) {
                 requestId++;
                 Chat.ClientRequest listReq = Chat.ClientRequest.newBuilder()
                     .setRequestId(requestId)
                     .setTimestampMs(nowMs())
                     .setListChannels(Chat.ListChannelsRequest.newBuilder().build())
                     .build();
-                send(socket, clientName, listReq);
-                recv(socket, clientName);
+                send(reqSocket, clientName, listReq);
+                Chat.ServerResponse listRes = recv(reqSocket, clientName);
 
-                sleep(10_000);
+                List<String> channels = new ArrayList<>();
+                if (listRes.getOk()) {
+                    channels.addAll(listRes.getListChannels().getChannelsList());
+                }
+
+                if (channels.size() < 5) {
+                    requestId++;
+                    String channelToCreate = channels.contains(createChannelName)
+                        ? randomChannelName(username)
+                        : createChannelName;
+                    Chat.ClientRequest createReq = Chat.ClientRequest.newBuilder()
+                        .setRequestId(requestId)
+                        .setTimestampMs(nowMs())
+                        .setCreateChannel(
+                            Chat.CreateChannelRequest.newBuilder()
+                                .setChannelName(channelToCreate)
+                                .setRequestedBy(username)
+                                .build())
+                        .build();
+                    send(reqSocket, clientName, createReq);
+                    recv(reqSocket, clientName);
+                }
+
+                requestId++;
+                Chat.ClientRequest refreshReq = Chat.ClientRequest.newBuilder()
+                    .setRequestId(requestId)
+                    .setTimestampMs(nowMs())
+                    .setListChannels(Chat.ListChannelsRequest.newBuilder().build())
+                    .build();
+                send(reqSocket, clientName, refreshReq);
+                Chat.ServerResponse refreshRes = recv(reqSocket, clientName);
+
+                channels.clear();
+                if (refreshRes.getOk()) {
+                    channels.addAll(refreshRes.getListChannels().getChannelsList());
+                }
+
+                if (subscribedChannels.size() < 3) {
+                    List<String> candidates = channels.stream().filter(ch -> !subscribedChannels.contains(ch)).toList();
+                    if (!candidates.isEmpty()) {
+                        String selected = candidates.get(ThreadLocalRandom.current().nextInt(candidates.size()));
+                        subSocket.subscribe(selected.getBytes(ZMQ.CHARSET));
+                        subscribedChannels.add(selected);
+                        System.out.printf("[%s] subscribed channel=%s total=%d%n", clientName, selected, subscribedChannels.size());
+                        drainSubMessages(subSocket, clientName);
+                    }
+                }
+
+                if (channels.isEmpty()) {
+                    sleep(1000);
+                    continue;
+                }
+
+                String selectedChannel = channels.get(ThreadLocalRandom.current().nextInt(channels.size()));
+                for (int i = 0; i < 10; i++) {
+                    requestId++;
+                    Chat.ClientRequest publishReq = Chat.ClientRequest.newBuilder()
+                        .setRequestId(requestId)
+                        .setTimestampMs(nowMs())
+                        .setPublishInChannel(
+                            Chat.PublishInChannelRequest.newBuilder()
+                                .setChannelName(selectedChannel)
+                                .setMessage(randomMessage())
+                                .setRequestedBy(username)
+                                .build())
+                        .build();
+                    send(reqSocket, clientName, publishReq);
+                    recv(reqSocket, clientName);
+                    drainSubMessages(subSocket, clientName);
+                    sleep(1000);
+                }
             }
         }
     }
@@ -87,6 +156,33 @@ public class JavaClient {
         }
     }
 
+    private static void drainSubMessages(ZMQ.Socket subSocket, String clientName) {
+        while (true) {
+            byte[] topicBytes = subSocket.recv(ZMQ.DONTWAIT);
+            if (topicBytes == null) {
+                break;
+            }
+            byte[] payload = subSocket.recv(0);
+            if (payload == null) {
+                break;
+            }
+            String topic = new String(topicBytes, ZMQ.CHARSET);
+            try {
+                Chat.ChannelMessageEvent event = Chat.ChannelMessageEvent.parseFrom(payload);
+                System.out.printf(
+                    "[%s] sub_recv channel=%s msg=%s sent_ts_ms=%d recv_ts_ms=%d%n",
+                    clientName,
+                    topic,
+                    event.getMessage(),
+                    event.getRequestTimestampMs(),
+                    nowMs()
+                );
+            } catch (Exception e) {
+                System.err.printf("[%s] sub_parse_error=%s%n", clientName, e.getMessage());
+            }
+        }
+    }
+
     private static String summarize(Chat.ClientRequest req) {
         return "ClientRequest{requestId=" + req.getRequestId() + ", ts=" + req.getTimestampMs() + ", payload=" + req.getPayloadCase() + "}";
     }
@@ -101,5 +197,27 @@ public class JavaClient {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    private static String randomChannelName(String username) {
+        String alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+        StringBuilder suffix = new StringBuilder();
+        for (int i = 0; i < 6; i++) {
+            int idx = ThreadLocalRandom.current().nextInt(alphabet.length());
+            suffix.append(alphabet.charAt(idx));
+        }
+        String value = username + "_" + suffix;
+        return value.length() > 20 ? value.substring(0, 20) : value;
+    }
+
+    private static String randomMessage() {
+        String[] samples = {
+            "mesh chat canal bot",
+            "sistemas distribuidos pub sub",
+            "zeromq broker publisher subscriber",
+            "mensagem aleatoria para teste"
+        };
+        int idx = ThreadLocalRandom.current().nextInt(samples.length);
+        return samples[idx];
     }
 }

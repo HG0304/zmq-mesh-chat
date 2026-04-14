@@ -6,5 +6,6 @@ COPY broker/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY broker/broker.py /app/broker.py
+COPY broker/pubsub_proxy.py /app/pubsub_proxy.py
 
 CMD ["python", "/app/broker.py"]

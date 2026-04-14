@@ -48,6 +48,29 @@ public class ChatRepository {
                     created_by TEXT NOT NULL
                 )
             """);
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS publications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel_name TEXT NOT NULL,
+                    message_text TEXT NOT NULL,
+                    sent_by TEXT NOT NULL,
+                    request_ts_ms INTEGER NOT NULL,
+                    published_ts_ms INTEGER NOT NULL
+                )
+            """);
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS request_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id INTEGER NOT NULL,
+                    operation TEXT NOT NULL,
+                    username TEXT,
+                    request_ts_ms INTEGER NOT NULL,
+                    handled_ts_ms INTEGER NOT NULL,
+                    ok INTEGER NOT NULL,
+                    error_code TEXT,
+                    details TEXT
+                )
+            """);
         } catch (SQLException e) {
             throw new RuntimeException("failed to initialize schema", e);
         }
@@ -98,6 +121,68 @@ public class ChatRepository {
             return channels;
         } catch (SQLException e) {
             throw new RuntimeException("failed to list channels", e);
+        }
+    }
+
+    public synchronized boolean channelExists(String channelName) {
+        try (Connection conn = connect();
+             PreparedStatement ps = conn.prepareStatement("SELECT 1 FROM channels WHERE name = ?")) {
+            ps.setString(1, channelName);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("failed to check channel", e);
+        }
+    }
+
+    public synchronized void savePublication(
+        String channelName,
+        String messageText,
+        String sentBy,
+        long requestTsMs,
+        long publishedTsMs
+    ) {
+        try (Connection conn = connect();
+             PreparedStatement ps = conn.prepareStatement(
+                 "INSERT INTO publications (channel_name, message_text, sent_by, request_ts_ms, published_ts_ms) VALUES (?, ?, ?, ?, ?)")
+        ) {
+            ps.setString(1, channelName);
+            ps.setString(2, messageText);
+            ps.setString(3, sentBy);
+            ps.setLong(4, requestTsMs);
+            ps.setLong(5, publishedTsMs);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new RuntimeException("failed to insert publication", e);
+        }
+    }
+
+    public synchronized void logRequest(
+        long requestId,
+        String operation,
+        String username,
+        long requestTsMs,
+        long handledTsMs,
+        boolean ok,
+        String errorCode,
+        String details
+    ) {
+        try (Connection conn = connect();
+             PreparedStatement ps = conn.prepareStatement(
+                 "INSERT INTO request_logs (request_id, operation, username, request_ts_ms, handled_ts_ms, ok, error_code, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        ) {
+            ps.setLong(1, requestId);
+            ps.setString(2, operation);
+            ps.setString(3, username);
+            ps.setLong(4, requestTsMs);
+            ps.setLong(5, handledTsMs);
+            ps.setInt(6, ok ? 1 : 0);
+            ps.setString(7, errorCode);
+            ps.setString(8, details);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new RuntimeException("failed to insert request log", e);
         }
     }
 }

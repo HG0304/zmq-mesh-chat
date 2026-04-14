@@ -5,6 +5,13 @@ services:
       dockerfile: broker/Dockerfile
     container_name: broker
 
+  pubsub-proxy:
+    build:
+      context: .
+      dockerfile: broker/Dockerfile
+    container_name: pubsub-proxy
+    command: ["python", "/app/pubsub_proxy.py"]
+
   py-server-1:
     build:
       context: .
@@ -13,11 +20,13 @@ services:
       APP_MODE: server
       SERVER_NAME: py-server-1
       BROKER_BACKEND_ADDR: tcp://broker:5556
+      PUBSUB_XSUB_ADDR: tcp://pubsub-proxy:5557
       DB_PATH: /data/chat.db
     volumes:
       - py_server_1_data:/data
     depends_on:
       - broker
+      - pubsub-proxy
 
   py-server-2:
     build:
@@ -27,11 +36,13 @@ services:
       APP_MODE: server
       SERVER_NAME: py-server-2
       BROKER_BACKEND_ADDR: tcp://broker:5556
+      PUBSUB_XSUB_ADDR: tcp://pubsub-proxy:5557
       DB_PATH: /data/chat.db
     volumes:
       - py_server_2_data:/data
     depends_on:
       - broker
+      - pubsub-proxy
 
   java-server-1:
     build:
@@ -41,11 +52,13 @@ services:
       APP_MODE: server
       SERVER_NAME: java-server-1
       BROKER_BACKEND_ADDR: tcp://broker:5556
+      PUBSUB_XSUB_ADDR: tcp://pubsub-proxy:5557
       DB_PATH: /data/chat.db
     volumes:
       - java_server_1_data:/data
     depends_on:
       - broker
+      - pubsub-proxy
 
   java-server-2:
     build:
@@ -55,11 +68,13 @@ services:
       APP_MODE: server
       SERVER_NAME: java-server-2
       BROKER_BACKEND_ADDR: tcp://broker:5556
+      PUBSUB_XSUB_ADDR: tcp://pubsub-proxy:5557
       DB_PATH: /data/chat.db
     volumes:
       - java_server_2_data:/data
     depends_on:
       - broker
+      - pubsub-proxy
 
   py-client-1:
     build:
@@ -71,8 +86,10 @@ services:
       USERNAME: py_user_1
       CREATE_CHANNEL_NAME: PyCanalA
       BROKER_FRONTEND_ADDR: tcp://broker:5555
+      PUBSUB_XPUB_ADDR: tcp://pubsub-proxy:5558
     depends_on:
       - broker
+      - pubsub-proxy
       - py-server-1
       - py-server-2
       - java-server-1
@@ -88,8 +105,10 @@ services:
       USERNAME: py_user_2
       CREATE_CHANNEL_NAME: PyCanalB
       BROKER_FRONTEND_ADDR: tcp://broker:5555
+      PUBSUB_XPUB_ADDR: tcp://pubsub-proxy:5558
     depends_on:
       - broker
+      - pubsub-proxy
       - py-server-1
       - py-server-2
       - java-server-1
@@ -105,8 +124,10 @@ services:
       USERNAME: java_user_1
       CREATE_CHANNEL_NAME: JavaCanalA
       BROKER_FRONTEND_ADDR: tcp://broker:5555
+      PUBSUB_XPUB_ADDR: tcp://pubsub-proxy:5558
     depends_on:
       - broker
+      - pubsub-proxy
       - py-server-1
       - py-server-2
       - java-server-1
@@ -122,8 +143,10 @@ services:
       USERNAME: java_user_2
       CREATE_CHANNEL_NAME: JavaCanalB
       BROKER_FRONTEND_ADDR: tcp://broker:5555
+      PUBSUB_XPUB_ADDR: tcp://pubsub-proxy:5558
     depends_on:
       - broker
+      - pubsub-proxy
       - py-server-1
       - py-server-2
       - java-server-1
