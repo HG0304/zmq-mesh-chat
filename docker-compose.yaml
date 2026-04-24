@@ -12,6 +12,16 @@ services:
     container_name: pubsub-proxy
     command: ["python", "/app/pubsub_proxy.py"]
 
+  reference:
+    build:
+      context: .
+      dockerfile: python/Dockerfile
+    container_name: reference
+    environment:
+      APP_MODE: reference
+      REFERENCE_BIND_ADDR: tcp://*:5560
+      REFERENCE_TTL_MS: 30000
+
   py-server-1:
     build:
       context: .
@@ -21,12 +31,14 @@ services:
       SERVER_NAME: py-server-1
       BROKER_BACKEND_ADDR: tcp://broker:5556
       PUBSUB_XSUB_ADDR: tcp://pubsub-proxy:5557
+      REFERENCE_ADDR: tcp://reference:5560
       DB_PATH: /data/chat.db
     volumes:
       - py_server_1_data:/data
     depends_on:
       - broker
       - pubsub-proxy
+      - reference
 
   py-server-2:
     build:
@@ -37,12 +49,14 @@ services:
       SERVER_NAME: py-server-2
       BROKER_BACKEND_ADDR: tcp://broker:5556
       PUBSUB_XSUB_ADDR: tcp://pubsub-proxy:5557
+      REFERENCE_ADDR: tcp://reference:5560
       DB_PATH: /data/chat.db
     volumes:
       - py_server_2_data:/data
     depends_on:
       - broker
       - pubsub-proxy
+      - reference
 
   java-server-1:
     build:
@@ -53,12 +67,14 @@ services:
       SERVER_NAME: java-server-1
       BROKER_BACKEND_ADDR: tcp://broker:5556
       PUBSUB_XSUB_ADDR: tcp://pubsub-proxy:5557
+      REFERENCE_ADDR: tcp://reference:5560
       DB_PATH: /data/chat.db
     volumes:
       - java_server_1_data:/data
     depends_on:
       - broker
       - pubsub-proxy
+      - reference
 
   java-server-2:
     build:
@@ -69,12 +85,14 @@ services:
       SERVER_NAME: java-server-2
       BROKER_BACKEND_ADDR: tcp://broker:5556
       PUBSUB_XSUB_ADDR: tcp://pubsub-proxy:5557
+      REFERENCE_ADDR: tcp://reference:5560
       DB_PATH: /data/chat.db
     volumes:
       - java_server_2_data:/data
     depends_on:
       - broker
       - pubsub-proxy
+      - reference
 
   py-client-1:
     build:

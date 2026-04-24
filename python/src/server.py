@@ -11,27 +11,80 @@ from generated import chat_pb2
 CHANNEL_PATTERN = re.compile(r"^[A-Za-z0-9_-]{3,20}$")
 
 
-def now_ms() -> int:
-    return int(time.time() * 1000)
+def now_ms(offset_ms: int = 0) -> int:
+    return int(time.time() * 1000) + offset_ms
+
+
+def sync_with_received(local_clock: int, received_clock: int) -> int:
+    return max(local_clock, received_clock)
+
+
+def send_reference_request(
+    ref_socket: zmq.Socket,
+    logical_clock: int,
+    request: chat_pb2.ReferenceRequest,
+) -> tuple[int, chat_pb2.ReferenceResponse]:
+    logical_clock += 1
+    request.logical_clock = logical_clock
+    ref_socket.send(request.SerializeToString())
+
+    raw = ref_socket.recv()
+    response = chat_pb2.ReferenceResponse()
+    response.ParseFromString(raw)
+    logical_clock = sync_with_received(logical_clock, response.logical_clock)
+    return logical_clock, response
 
 
 def main() -> None:
     server_name = os.getenv("SERVER_NAME", "py-server")
     broker_backend_addr = os.getenv("BROKER_BACKEND_ADDR", "tcp://broker:5556")
     pubsub_xsub_addr = os.getenv("PUBSUB_XSUB_ADDR", "tcp://pubsub-proxy:5557")
+    reference_addr = os.getenv("REFERENCE_ADDR", "tcp://reference:5560")
     db_path = os.getenv("DB_PATH", "/data/chat.db")
 
     db = ChatDB(db_path)
     active_users: Set[str] = set()
+    logical_clock = 0
+    clock_offset_ms = 0
+    server_rank = 0
+    received_client_messages = 0
 
     context = zmq.Context()
     rep_socket = context.socket(zmq.REP)
     rep_socket.connect(broker_backend_addr)
+
     pub_socket = context.socket(zmq.PUB)
     pub_socket.connect(pubsub_xsub_addr)
 
+    ref_socket = context.socket(zmq.REQ)
+    ref_socket.connect(reference_addr)
+
+    logical_clock, register_res = send_reference_request(
+        ref_socket,
+        logical_clock,
+        chat_pb2.ReferenceRequest(
+            timestamp_ms=now_ms(clock_offset_ms),
+            register_server=chat_pb2.RefRegisterServerRequest(server_name=server_name),
+        ),
+    )
+    if register_res.ok:
+        server_rank = register_res.register_server.rank
+        clock_offset_ms = register_res.reference_timestamp_ms - int(time.time() * 1000)
+
+    logical_clock, list_res = send_reference_request(
+        ref_socket,
+        logical_clock,
+        chat_pb2.ReferenceRequest(
+            timestamp_ms=now_ms(clock_offset_ms),
+            list_servers=chat_pb2.RefListServersRequest(),
+        ),
+    )
+
     print(
-        f"[{server_name}] connected backend={broker_backend_addr} pubsub_xsub={pubsub_xsub_addr} db={db_path}",
+        (
+            f"[{server_name}] connected backend={broker_backend_addr} pubsub_xsub={pubsub_xsub_addr} "
+            f"reference={reference_addr} rank={server_rank} known_servers={len(list_res.list_servers.servers)} db={db_path}"
+        ),
         flush=True,
     )
 
@@ -40,9 +93,12 @@ def main() -> None:
         req = chat_pb2.ClientRequest()
         req.ParseFromString(raw)
 
+        logical_clock = sync_with_received(logical_clock, req.logical_clock)
+        received_client_messages += 1
+
         res = chat_pb2.ServerResponse(
             request_id=req.request_id,
-            timestamp_ms=now_ms(),
+            timestamp_ms=now_ms(clock_offset_ms),
             ok=False,
         )
         operation = "unknown"
@@ -106,12 +162,15 @@ def main() -> None:
                 res.error_code = "EMPTY_MESSAGE"
                 res.error_message = "message must not be empty"
             else:
+                logical_clock += 1
+                publish_ts = now_ms(clock_offset_ms)
                 event = chat_pb2.ChannelMessageEvent(
                     channel_name=channel_name,
                     message=message_text,
                     sent_by=requested_by,
                     request_timestamp_ms=req.timestamp_ms,
-                    published_timestamp_ms=res.timestamp_ms,
+                    published_timestamp_ms=publish_ts,
+                    logical_clock=logical_clock,
                 )
                 pub_socket.send_multipart(
                     [channel_name.encode("utf-8"), event.SerializeToString()]
@@ -121,11 +180,11 @@ def main() -> None:
                     message_text=message_text,
                     sent_by=requested_by,
                     request_ts_ms=req.timestamp_ms,
-                    published_ts_ms=res.timestamp_ms,
+                    published_ts_ms=publish_ts,
                 )
                 res.ok = True
                 res.publish_in_channel.channel_name = channel_name
-                res.publish_in_channel.published_timestamp_ms = res.timestamp_ms
+                res.publish_in_channel.published_timestamp_ms = publish_ts
 
         else:
             res.error_code = "UNKNOWN_REQUEST"
@@ -146,7 +205,25 @@ def main() -> None:
             f"[{server_name}] recv={req} send={res}",
             flush=True,
         )
+        logical_clock += 1
+        res.timestamp_ms = now_ms(clock_offset_ms)
+        res.logical_clock = logical_clock
         rep_socket.send(res.SerializeToString())
+
+        if received_client_messages % 10 == 0:
+            logical_clock, hb_res = send_reference_request(
+                ref_socket,
+                logical_clock,
+                chat_pb2.ReferenceRequest(
+                    timestamp_ms=now_ms(clock_offset_ms),
+                    heartbeat=chat_pb2.RefHeartbeatRequest(
+                        server_name=server_name,
+                        rank=server_rank,
+                    ),
+                ),
+            )
+            if hb_res.ok:
+                clock_offset_ms = hb_res.reference_timestamp_ms - int(time.time() * 1000)
 
 
 if __name__ == "__main__":

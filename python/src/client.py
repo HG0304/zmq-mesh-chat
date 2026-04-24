@@ -12,6 +12,10 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def sync_with_received(local_clock: int, received_clock: int) -> int:
+    return max(local_clock, received_clock)
+
+
 def random_channel_name(username: str) -> str:
     suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
     base = f"{username}_{suffix}"
@@ -34,7 +38,11 @@ def random_message() -> str:
     return " ".join(words[:4])
 
 
-def drain_sub_messages(sub_socket: zmq.Socket, client_name: str) -> None:
+def drain_sub_messages(
+    sub_socket: zmq.Socket,
+    client_name: str,
+    logical_clock: int,
+) -> int:
     while True:
         try:
             frames = sub_socket.recv_multipart(flags=zmq.DONTWAIT)
@@ -48,16 +56,49 @@ def drain_sub_messages(sub_socket: zmq.Socket, client_name: str) -> None:
         _, payload = frames
         event = chat_pb2.ChannelMessageEvent()
         event.ParseFromString(payload)
+        logical_clock = sync_with_received(logical_clock, event.logical_clock)
         print(
             (
                 f"[{client_name}] sub_recv "
                 f"channel={event.channel_name} "
                 f"msg={event.message!r} "
                 f"sent_ts_ms={event.request_timestamp_ms} "
+                f"event_lc={event.logical_clock} "
+                f"local_lc={logical_clock} "
                 f"recv_ts_ms={recv_ts_ms}"
             ),
             flush=True,
         )
+
+    return logical_clock
+
+
+def send_req(
+    req_socket: zmq.Socket,
+    request: chat_pb2.ClientRequest,
+    request_id: int,
+    logical_clock: int,
+    client_name: str,
+) -> int:
+    logical_clock += 1
+    request.request_id = request_id
+    request.timestamp_ms = now_ms()
+    request.logical_clock = logical_clock
+    print(f"[{client_name}] send={request}", flush=True)
+    req_socket.send(request.SerializeToString())
+    return logical_clock
+
+
+def recv_res(
+    req_socket: zmq.Socket,
+    logical_clock: int,
+    client_name: str,
+) -> tuple[int, chat_pb2.ServerResponse]:
+    response = chat_pb2.ServerResponse()
+    response.ParseFromString(req_socket.recv())
+    logical_clock = sync_with_received(logical_clock, response.logical_clock)
+    print(f"[{client_name}] recv={response} local_lc={logical_clock}", flush=True)
+    return logical_clock, response
 
 
 def main() -> None:
@@ -67,6 +108,7 @@ def main() -> None:
     pubsub_xpub_addr = os.getenv("PUBSUB_XPUB_ADDR", "tcp://pubsub-proxy:5558")
     create_channel_name = os.getenv("CREATE_CHANNEL_NAME", f"{username}_ch")
     request_id = random.randint(1, 10_000)
+    logical_clock = 0
 
     context = zmq.Context()
     req_socket = context.socket(zmq.REQ)
@@ -87,16 +129,15 @@ def main() -> None:
 
     while True:
         request_id += 1
-        login_req = chat_pb2.ClientRequest(
+        login_req = chat_pb2.ClientRequest(login=chat_pb2.LoginRequest(username=username))
+        logical_clock = send_req(
+            req_socket=req_socket,
+            request=login_req,
             request_id=request_id,
-            timestamp_ms=now_ms(),
-            login=chat_pb2.LoginRequest(username=username),
+            logical_clock=logical_clock,
+            client_name=client_name,
         )
-        print(f"[{client_name}] send={login_req}", flush=True)
-        req_socket.send(login_req.SerializeToString())
-        login_res = chat_pb2.ServerResponse()
-        login_res.ParseFromString(req_socket.recv())
-        print(f"[{client_name}] recv={login_res}", flush=True)
+        logical_clock, login_res = recv_res(req_socket, logical_clock, client_name)
 
         if not login_res.ok:
             time.sleep(5)
@@ -106,16 +147,15 @@ def main() -> None:
 
     while True:
         request_id += 1
-        list_req = chat_pb2.ClientRequest(
+        list_req = chat_pb2.ClientRequest(list_channels=chat_pb2.ListChannelsRequest())
+        logical_clock = send_req(
+            req_socket=req_socket,
+            request=list_req,
             request_id=request_id,
-            timestamp_ms=now_ms(),
-            list_channels=chat_pb2.ListChannelsRequest(),
+            logical_clock=logical_clock,
+            client_name=client_name,
         )
-        print(f"[{client_name}] send={list_req}", flush=True)
-        req_socket.send(list_req.SerializeToString())
-        list_res = chat_pb2.ServerResponse()
-        list_res.ParseFromString(req_socket.recv())
-        print(f"[{client_name}] recv={list_res}", flush=True)
+        logical_clock, list_res = recv_res(req_socket, logical_clock, client_name)
 
         channels = list(list_res.list_channels.channels) if list_res.ok else []
 
@@ -123,30 +163,32 @@ def main() -> None:
             request_id += 1
             new_channel = create_channel_name if create_channel_name not in channels else random_channel_name(username)
             create_req = chat_pb2.ClientRequest(
-                request_id=request_id,
-                timestamp_ms=now_ms(),
                 create_channel=chat_pb2.CreateChannelRequest(
                     channel_name=new_channel,
                     requested_by=username,
                 ),
             )
-            print(f"[{client_name}] send={create_req}", flush=True)
-            req_socket.send(create_req.SerializeToString())
-            create_res = chat_pb2.ServerResponse()
-            create_res.ParseFromString(req_socket.recv())
-            print(f"[{client_name}] recv={create_res}", flush=True)
+            logical_clock = send_req(
+                req_socket=req_socket,
+                request=create_req,
+                request_id=request_id,
+                logical_clock=logical_clock,
+                client_name=client_name,
+            )
+            logical_clock, _ = recv_res(req_socket, logical_clock, client_name)
 
         request_id += 1
         refresh_req = chat_pb2.ClientRequest(
-            request_id=request_id,
-            timestamp_ms=now_ms(),
             list_channels=chat_pb2.ListChannelsRequest(),
         )
-        print(f"[{client_name}] send={refresh_req}", flush=True)
-        req_socket.send(refresh_req.SerializeToString())
-        refresh_res = chat_pb2.ServerResponse()
-        refresh_res.ParseFromString(req_socket.recv())
-        print(f"[{client_name}] recv={refresh_res}", flush=True)
+        logical_clock = send_req(
+            req_socket=req_socket,
+            request=refresh_req,
+            request_id=request_id,
+            logical_clock=logical_clock,
+            client_name=client_name,
+        )
+        logical_clock, refresh_res = recv_res(req_socket, logical_clock, client_name)
         channels = list(refresh_res.list_channels.channels) if refresh_res.ok else []
 
         if len(subscribed_channels) < 3:
@@ -159,7 +201,7 @@ def main() -> None:
                     f"[{client_name}] subscribed channel={selected} total={len(subscribed_channels)}",
                     flush=True,
                 )
-                drain_sub_messages(sub_socket, client_name)
+                logical_clock = drain_sub_messages(sub_socket, client_name, logical_clock)
 
         if not channels:
             time.sleep(1)
@@ -169,20 +211,21 @@ def main() -> None:
         for _ in range(10):
             request_id += 1
             publish_req = chat_pb2.ClientRequest(
-                request_id=request_id,
-                timestamp_ms=now_ms(),
                 publish_in_channel=chat_pb2.PublishInChannelRequest(
                     channel_name=selected_channel,
                     message=random_message(),
                     requested_by=username,
                 ),
             )
-            print(f"[{client_name}] send={publish_req}", flush=True)
-            req_socket.send(publish_req.SerializeToString())
-            publish_res = chat_pb2.ServerResponse()
-            publish_res.ParseFromString(req_socket.recv())
-            print(f"[{client_name}] recv={publish_res}", flush=True)
-            drain_sub_messages(sub_socket, client_name)
+            logical_clock = send_req(
+                req_socket=req_socket,
+                request=publish_req,
+                request_id=request_id,
+                logical_clock=logical_clock,
+                client_name=client_name,
+            )
+            logical_clock, _ = recv_res(req_socket, logical_clock, client_name)
+            logical_clock = drain_sub_messages(sub_socket, client_name, logical_clock)
             time.sleep(1)
 
 

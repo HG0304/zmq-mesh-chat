@@ -18,10 +18,16 @@ public class JavaServer {
         String serverName = System.getenv().getOrDefault("SERVER_NAME", "java-server");
         String backendAddr = System.getenv().getOrDefault("BROKER_BACKEND_ADDR", "tcp://broker:5556");
         String pubsubXsubAddr = System.getenv().getOrDefault("PUBSUB_XSUB_ADDR", "tcp://pubsub-proxy:5557");
+        String referenceAddr = System.getenv().getOrDefault("REFERENCE_ADDR", "tcp://reference:5560");
         String dbPath = System.getenv().getOrDefault("DB_PATH", "/data/chat.db");
 
         ChatRepository repo = new ChatRepository(dbPath);
         Set<String> activeUsers = new HashSet<>();
+
+        long logicalClock = 0;
+        long clockOffsetMs = 0;
+        int serverRank = 0;
+        int receivedClientMessages = 0;
 
         try (ZContext context = new ZContext()) {
             ZMQ.Socket repSocket = context.createSocket(SocketType.REP);
@@ -29,7 +35,44 @@ public class JavaServer {
 
             ZMQ.Socket pubSocket = context.createSocket(SocketType.PUB);
             pubSocket.connect(pubsubXsubAddr);
-            System.out.printf("[%s] connected backend=%s pubsub_xsub=%s db=%s%n", serverName, backendAddr, pubsubXsubAddr, dbPath);
+
+            ZMQ.Socket refSocket = context.createSocket(SocketType.REQ);
+            refSocket.connect(referenceAddr);
+
+            RefCallResult registerResult = callReference(
+                refSocket,
+                logicalClock,
+                Chat.ReferenceRequest.newBuilder()
+                    .setTimestampMs(nowMs(clockOffsetMs))
+                    .setRegisterServer(Chat.RefRegisterServerRequest.newBuilder().setServerName(serverName).build())
+                    .build()
+            );
+            logicalClock = registerResult.logicalClock;
+            if (registerResult.response.getOk()) {
+                serverRank = registerResult.response.getRegisterServer().getRank();
+                clockOffsetMs = registerResult.response.getReferenceTimestampMs() - System.currentTimeMillis();
+            }
+
+            RefCallResult listResult = callReference(
+                refSocket,
+                logicalClock,
+                Chat.ReferenceRequest.newBuilder()
+                    .setTimestampMs(nowMs(clockOffsetMs))
+                    .setListServers(Chat.RefListServersRequest.newBuilder().build())
+                    .build()
+            );
+            logicalClock = listResult.logicalClock;
+
+            System.out.printf(
+                "[%s] connected backend=%s pubsub_xsub=%s reference=%s rank=%d known_servers=%d db=%s%n",
+                serverName,
+                backendAddr,
+                pubsubXsubAddr,
+                referenceAddr,
+                serverRank,
+                listResult.response.getListServers().getServersCount(),
+                dbPath
+            );
 
             while (!Thread.currentThread().isInterrupted()) {
                 byte[] raw = repSocket.recv(0);
@@ -41,9 +84,11 @@ public class JavaServer {
                 try {
                     req = Chat.ClientRequest.parseFrom(raw);
                 } catch (Exception e) {
+                    logicalClock++;
                     Chat.ServerResponse response = Chat.ServerResponse.newBuilder()
                         .setRequestId(0)
-                        .setTimestampMs(nowMs())
+                        .setTimestampMs(nowMs(clockOffsetMs))
+                        .setLogicalClock(logicalClock)
                         .setOk(false)
                         .setErrorCode("BAD_PROTOBUF")
                         .setErrorMessage("failed to parse request")
@@ -52,10 +97,12 @@ public class JavaServer {
                     continue;
                 }
 
-                long ts = nowMs();
+                logicalClock = Math.max(logicalClock, req.getLogicalClock());
+                receivedClientMessages++;
+
                 Chat.ServerResponse.Builder res = Chat.ServerResponse.newBuilder()
                     .setRequestId(req.getRequestId())
-                    .setTimestampMs(ts)
+                    .setTimestampMs(nowMs(clockOffsetMs))
                     .setOk(false);
                 String operation = "unknown";
                 String username = "";
@@ -71,7 +118,7 @@ public class JavaServer {
                             res.setErrorMessage("username '" + username + "' already active");
                         } else {
                             activeUsers.add(username);
-                            repo.registerLogin(username, ts);
+                            repo.registerLogin(username, nowMs(clockOffsetMs));
                             res.setOk(true);
                             res.setLogin(Chat.LoginResponse.newBuilder().setUsername(username).build());
                         }
@@ -86,7 +133,7 @@ public class JavaServer {
                             res.setErrorCode("INVALID_CHANNEL_NAME");
                             res.setErrorMessage("channel must match ^[A-Za-z0-9_-]{3,20}$");
                         } else {
-                            boolean created = repo.createChannel(channelName, requestedBy, ts);
+                            boolean created = repo.createChannel(channelName, requestedBy, nowMs(clockOffsetMs));
                             if (!created) {
                                 res.setErrorCode("CHANNEL_EXISTS");
                                 res.setErrorMessage("channel '" + channelName + "' already exists");
@@ -117,23 +164,26 @@ public class JavaServer {
                             res.setErrorCode("EMPTY_MESSAGE");
                             res.setErrorMessage("message must not be empty");
                         } else {
+                            logicalClock++;
+                            long publishTs = nowMs(clockOffsetMs);
                             Chat.ChannelMessageEvent event = Chat.ChannelMessageEvent.newBuilder()
                                 .setChannelName(channelName)
                                 .setMessage(messageText)
                                 .setSentBy(requestedBy)
                                 .setRequestTimestampMs(req.getTimestampMs())
-                                .setPublishedTimestampMs(ts)
+                                .setPublishedTimestampMs(publishTs)
+                                .setLogicalClock(logicalClock)
                                 .build();
 
                             pubSocket.sendMore(channelName);
                             pubSocket.send(event.toByteArray());
 
-                            repo.savePublication(channelName, messageText, requestedBy, req.getTimestampMs(), ts);
+                            repo.savePublication(channelName, messageText, requestedBy, req.getTimestampMs(), publishTs);
                             res.setOk(true);
                             res.setPublishInChannel(
                                 Chat.PublishInChannelResponse.newBuilder()
                                     .setChannelName(channelName)
-                                    .setPublishedTimestampMs(ts)
+                                    .setPublishedTimestampMs(publishTs)
                                     .build()
                             );
                         }
@@ -144,32 +194,84 @@ public class JavaServer {
                     }
                 }
 
-                Chat.ServerResponse response = res.build();
+                logicalClock++;
+                Chat.ServerResponse response = res
+                    .setTimestampMs(nowMs(clockOffsetMs))
+                    .setLogicalClock(logicalClock)
+                    .build();
                 repo.logRequest(
                     req.getRequestId(),
                     operation,
                     username,
                     req.getTimestampMs(),
-                    ts,
+                    response.getTimestampMs(),
                     response.getOk(),
                     response.getErrorCode(),
                     details
                 );
-                System.out.printf("[%s] recv=%s send=%s%n", serverName, summarize(req), summarize(response));
+                System.out.printf("[%s] recv=%s send=%s local_lc=%d%n", serverName, summarize(req), summarize(response), logicalClock);
                 repSocket.send(response.toByteArray());
+
+                if (receivedClientMessages % 10 == 0) {
+                    RefCallResult hbResult = callReference(
+                        refSocket,
+                        logicalClock,
+                        Chat.ReferenceRequest.newBuilder()
+                            .setTimestampMs(nowMs(clockOffsetMs))
+                            .setHeartbeat(
+                                Chat.RefHeartbeatRequest.newBuilder()
+                                    .setServerName(serverName)
+                                    .setRank(serverRank)
+                                    .build())
+                            .build()
+                    );
+                    logicalClock = hbResult.logicalClock;
+                    if (hbResult.response.getOk()) {
+                        clockOffsetMs = hbResult.response.getReferenceTimestampMs() - System.currentTimeMillis();
+                    }
+                }
             }
         }
     }
 
-    private static long nowMs() {
-        return Instant.now().toEpochMilli();
+    private static RefCallResult callReference(ZMQ.Socket refSocket, long logicalClock, Chat.ReferenceRequest req) {
+        long nextClock = logicalClock + 1;
+        Chat.ReferenceRequest sendReq = req.toBuilder().setLogicalClock(nextClock).build();
+        refSocket.send(sendReq.toByteArray());
+
+        byte[] raw = refSocket.recv(0);
+        if (raw == null) {
+            return new RefCallResult(nextClock, Chat.ReferenceResponse.newBuilder().setOk(false).build());
+        }
+
+        try {
+            Chat.ReferenceResponse response = Chat.ReferenceResponse.parseFrom(raw);
+            long mergedClock = Math.max(nextClock, response.getLogicalClock());
+            return new RefCallResult(mergedClock, response);
+        } catch (Exception e) {
+            return new RefCallResult(nextClock, Chat.ReferenceResponse.newBuilder().setOk(false).build());
+        }
+    }
+
+    private static long nowMs(long offsetMs) {
+        return Instant.now().toEpochMilli() + offsetMs;
     }
 
     private static String summarize(Chat.ClientRequest req) {
-        return "ClientRequest{requestId=" + req.getRequestId() + ", ts=" + req.getTimestampMs() + ", payload=" + req.getPayloadCase() + "}";
+        return "ClientRequest{requestId=" + req.getRequestId() + ", ts=" + req.getTimestampMs() + ", lc=" + req.getLogicalClock() + ", payload=" + req.getPayloadCase() + "}";
     }
 
     private static String summarize(Chat.ServerResponse res) {
-        return "ServerResponse{requestId=" + res.getRequestId() + ", ts=" + res.getTimestampMs() + ", ok=" + res.getOk() + ", errorCode='" + res.getErrorCode() + "', payload=" + res.getPayloadCase() + "}";
+        return "ServerResponse{requestId=" + res.getRequestId() + ", ts=" + res.getTimestampMs() + ", lc=" + res.getLogicalClock() + ", ok=" + res.getOk() + ", errorCode='" + res.getErrorCode() + "', payload=" + res.getPayloadCase() + "}";
+    }
+
+    private static final class RefCallResult {
+        private final long logicalClock;
+        private final Chat.ReferenceResponse response;
+
+        private RefCallResult(long logicalClock, Chat.ReferenceResponse response) {
+            this.logicalClock = logicalClock;
+            this.response = response;
+        }
     }
 }

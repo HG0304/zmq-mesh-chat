@@ -22,6 +22,7 @@ public class JavaClient {
         String createChannelName = System.getenv().getOrDefault("CREATE_CHANNEL_NAME", username + "_ch");
 
         long requestId = ThreadLocalRandom.current().nextLong(1, 10_000);
+        long logicalClock = 0;
         Set<String> subscribedChannels = new HashSet<>();
 
         try (ZContext context = new ZContext()) {
@@ -38,10 +39,14 @@ public class JavaClient {
                 Chat.ClientRequest loginReq = Chat.ClientRequest.newBuilder()
                     .setRequestId(requestId)
                     .setTimestampMs(nowMs())
+                    .setLogicalClock(logicalClock + 1)
                     .setLogin(Chat.LoginRequest.newBuilder().setUsername(username).build())
                     .build();
-                send(reqSocket, clientName, loginReq);
-                Chat.ServerResponse loginRes = recv(reqSocket, clientName);
+                logicalClock = loginReq.getLogicalClock();
+                send(reqSocket, clientName, loginReq, logicalClock);
+                RecvResult loginResult = recv(reqSocket, clientName, logicalClock);
+                logicalClock = loginResult.logicalClock;
+                Chat.ServerResponse loginRes = loginResult.response;
                 if (loginRes.getOk()) {
                     break;
                 }
@@ -53,10 +58,14 @@ public class JavaClient {
                 Chat.ClientRequest listReq = Chat.ClientRequest.newBuilder()
                     .setRequestId(requestId)
                     .setTimestampMs(nowMs())
+                    .setLogicalClock(logicalClock + 1)
                     .setListChannels(Chat.ListChannelsRequest.newBuilder().build())
                     .build();
-                send(reqSocket, clientName, listReq);
-                Chat.ServerResponse listRes = recv(reqSocket, clientName);
+                logicalClock = listReq.getLogicalClock();
+                send(reqSocket, clientName, listReq, logicalClock);
+                RecvResult listResult = recv(reqSocket, clientName, logicalClock);
+                logicalClock = listResult.logicalClock;
+                Chat.ServerResponse listRes = listResult.response;
 
                 List<String> channels = new ArrayList<>();
                 if (listRes.getOk()) {
@@ -71,24 +80,30 @@ public class JavaClient {
                     Chat.ClientRequest createReq = Chat.ClientRequest.newBuilder()
                         .setRequestId(requestId)
                         .setTimestampMs(nowMs())
+                        .setLogicalClock(logicalClock + 1)
                         .setCreateChannel(
                             Chat.CreateChannelRequest.newBuilder()
                                 .setChannelName(channelToCreate)
                                 .setRequestedBy(username)
                                 .build())
                         .build();
-                    send(reqSocket, clientName, createReq);
-                    recv(reqSocket, clientName);
+                    logicalClock = createReq.getLogicalClock();
+                    send(reqSocket, clientName, createReq, logicalClock);
+                    logicalClock = recv(reqSocket, clientName, logicalClock).logicalClock;
                 }
 
                 requestId++;
                 Chat.ClientRequest refreshReq = Chat.ClientRequest.newBuilder()
                     .setRequestId(requestId)
                     .setTimestampMs(nowMs())
+                    .setLogicalClock(logicalClock + 1)
                     .setListChannels(Chat.ListChannelsRequest.newBuilder().build())
                     .build();
-                send(reqSocket, clientName, refreshReq);
-                Chat.ServerResponse refreshRes = recv(reqSocket, clientName);
+                logicalClock = refreshReq.getLogicalClock();
+                send(reqSocket, clientName, refreshReq, logicalClock);
+                RecvResult refreshResult = recv(reqSocket, clientName, logicalClock);
+                logicalClock = refreshResult.logicalClock;
+                Chat.ServerResponse refreshRes = refreshResult.response;
 
                 channels.clear();
                 if (refreshRes.getOk()) {
@@ -102,7 +117,7 @@ public class JavaClient {
                         subSocket.subscribe(selected.getBytes(ZMQ.CHARSET));
                         subscribedChannels.add(selected);
                         System.out.printf("[%s] subscribed channel=%s total=%d%n", clientName, selected, subscribedChannels.size());
-                        drainSubMessages(subSocket, clientName);
+                        logicalClock = drainSubMessages(subSocket, clientName, logicalClock);
                     }
                 }
 
@@ -117,6 +132,7 @@ public class JavaClient {
                     Chat.ClientRequest publishReq = Chat.ClientRequest.newBuilder()
                         .setRequestId(requestId)
                         .setTimestampMs(nowMs())
+                        .setLogicalClock(logicalClock + 1)
                         .setPublishInChannel(
                             Chat.PublishInChannelRequest.newBuilder()
                                 .setChannelName(selectedChannel)
@@ -124,9 +140,10 @@ public class JavaClient {
                                 .setRequestedBy(username)
                                 .build())
                         .build();
-                    send(reqSocket, clientName, publishReq);
-                    recv(reqSocket, clientName);
-                    drainSubMessages(subSocket, clientName);
+                    logicalClock = publishReq.getLogicalClock();
+                    send(reqSocket, clientName, publishReq, logicalClock);
+                    logicalClock = recv(reqSocket, clientName, logicalClock).logicalClock;
+                    logicalClock = drainSubMessages(subSocket, clientName, logicalClock);
                     sleep(1000);
                 }
             }
@@ -137,26 +154,27 @@ public class JavaClient {
         return Instant.now().toEpochMilli();
     }
 
-    private static void send(ZMQ.Socket socket, String clientName, Chat.ClientRequest req) {
-        System.out.printf("[%s] send=%s%n", clientName, summarize(req));
+    private static void send(ZMQ.Socket socket, String clientName, Chat.ClientRequest req, long logicalClock) {
+        System.out.printf("[%s] send=%s local_lc=%d%n", clientName, summarize(req), logicalClock);
         socket.send(req.toByteArray());
     }
 
-    private static Chat.ServerResponse recv(ZMQ.Socket socket, String clientName) {
+    private static RecvResult recv(ZMQ.Socket socket, String clientName, long logicalClock) {
         byte[] raw = socket.recv(0);
         if (raw == null) {
             throw new RuntimeException("failed to receive response");
         }
         try {
             Chat.ServerResponse res = Chat.ServerResponse.parseFrom(raw);
-            System.out.printf("[%s] recv=%s%n", clientName, summarize(res));
-            return res;
+            long mergedClock = Math.max(logicalClock, res.getLogicalClock());
+            System.out.printf("[%s] recv=%s local_lc=%d%n", clientName, summarize(res), mergedClock);
+            return new RecvResult(mergedClock, res);
         } catch (Exception e) {
             throw new RuntimeException("failed to parse response", e);
         }
     }
 
-    private static void drainSubMessages(ZMQ.Socket subSocket, String clientName) {
+    private static long drainSubMessages(ZMQ.Socket subSocket, String clientName, long logicalClock) {
         while (true) {
             byte[] topicBytes = subSocket.recv(ZMQ.DONTWAIT);
             if (topicBytes == null) {
@@ -169,26 +187,30 @@ public class JavaClient {
             String topic = new String(topicBytes, ZMQ.CHARSET);
             try {
                 Chat.ChannelMessageEvent event = Chat.ChannelMessageEvent.parseFrom(payload);
+                logicalClock = Math.max(logicalClock, event.getLogicalClock());
                 System.out.printf(
-                    "[%s] sub_recv channel=%s msg=%s sent_ts_ms=%d recv_ts_ms=%d%n",
+                    "[%s] sub_recv channel=%s msg=%s sent_ts_ms=%d recv_ts_ms=%d event_lc=%d local_lc=%d%n",
                     clientName,
                     topic,
                     event.getMessage(),
                     event.getRequestTimestampMs(),
-                    nowMs()
+                    nowMs(),
+                    event.getLogicalClock(),
+                    logicalClock
                 );
             } catch (Exception e) {
                 System.err.printf("[%s] sub_parse_error=%s%n", clientName, e.getMessage());
             }
         }
+        return logicalClock;
     }
 
     private static String summarize(Chat.ClientRequest req) {
-        return "ClientRequest{requestId=" + req.getRequestId() + ", ts=" + req.getTimestampMs() + ", payload=" + req.getPayloadCase() + "}";
+        return "ClientRequest{requestId=" + req.getRequestId() + ", ts=" + req.getTimestampMs() + ", lc=" + req.getLogicalClock() + ", payload=" + req.getPayloadCase() + "}";
     }
 
     private static String summarize(Chat.ServerResponse res) {
-        return "ServerResponse{requestId=" + res.getRequestId() + ", ts=" + res.getTimestampMs() + ", ok=" + res.getOk() + ", errorCode='" + res.getErrorCode() + "', payload=" + res.getPayloadCase() + "}";
+        return "ServerResponse{requestId=" + res.getRequestId() + ", ts=" + res.getTimestampMs() + ", lc=" + res.getLogicalClock() + ", ok=" + res.getOk() + ", errorCode='" + res.getErrorCode() + "', payload=" + res.getPayloadCase() + "}";
     }
 
     private static void sleep(long ms) {
@@ -219,5 +241,15 @@ public class JavaClient {
         };
         int idx = ThreadLocalRandom.current().nextInt(samples.length);
         return samples[idx];
+    }
+
+    private static final class RecvResult {
+        private final long logicalClock;
+        private final Chat.ServerResponse response;
+
+        private RecvResult(long logicalClock, Chat.ServerResponse response) {
+            this.logicalClock = logicalClock;
+            this.response = response;
+        }
     }
 }

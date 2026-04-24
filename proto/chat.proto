@@ -42,11 +42,67 @@ message ChannelMessageEvent {
   string sent_by = 3;
   int64 request_timestamp_ms = 4;
   int64 published_timestamp_ms = 5;
+  uint64 logical_clock = 6;
+}
+
+message ServerInfo {
+  string server_name = 1;
+  uint32 rank = 2;
+}
+
+message RefRegisterServerRequest {
+  string server_name = 1;
+}
+
+message RefListServersRequest {}
+
+message RefHeartbeatRequest {
+  string server_name = 1;
+  uint32 rank = 2;
+}
+
+message ReferenceRequest {
+  int64 timestamp_ms = 1;
+  uint64 logical_clock = 2;
+
+  oneof payload {
+    RefRegisterServerRequest register_server = 10;
+    RefListServersRequest list_servers = 11;
+    RefHeartbeatRequest heartbeat = 12;
+  }
+}
+
+message RefRegisterServerResponse {
+  uint32 rank = 1;
+}
+
+message RefListServersResponse {
+  repeated ServerInfo servers = 1;
+}
+
+message RefHeartbeatResponse {
+  string status = 1;
+}
+
+message ReferenceResponse {
+  int64 timestamp_ms = 1;
+  uint64 logical_clock = 2;
+  bool ok = 3;
+  string error_code = 4;
+  string error_message = 5;
+  int64 reference_timestamp_ms = 6;
+
+  oneof payload {
+    RefRegisterServerResponse register_server = 10;
+    RefListServersResponse list_servers = 11;
+    RefHeartbeatResponse heartbeat = 12;
+  }
 }
 
 message ClientRequest {
   uint64 request_id = 1;
   int64 timestamp_ms = 2;
+  uint64 logical_clock = 3;
 
   oneof payload {
     LoginRequest login = 10;
@@ -59,9 +115,10 @@ message ClientRequest {
 message ServerResponse {
   uint64 request_id = 1;
   int64 timestamp_ms = 2;
-  bool ok = 3;
-  string error_code = 4;
-  string error_message = 5;
+  uint64 logical_clock = 3;
+  bool ok = 4;
+  string error_code = 5;
+  string error_message = 6;
 
   oneof payload {
     LoginResponse login = 10;
