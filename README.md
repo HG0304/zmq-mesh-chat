@@ -2,7 +2,7 @@
 
 Projeto da disciplina de Sistemas Distribuídos implementando um chat distribuído com ZeroMQ.
 
-Esta versão cobre as Partes 1, 2 e 3 do enunciado:
+Esta versão cobre as Partes 1, 2, 3 e 5 do enunciado:
 - login de usuário (bot)
 - criação e listagem de canais
 - publicação em canais via Pub/Sub
@@ -10,6 +10,7 @@ Esta versão cobre as Partes 1, 2 e 3 do enunciado:
 - persistência em disco de operações e publicações
 - relógio lógico (Lamport) em clientes, servidores e eventos Pub/Sub
 - serviço de referência para rank, heartbeat e sincronização de relógio físico dos servidores
+- replicação do estado persistido entre servidores
 
 ## Arquitetura
 
@@ -69,6 +70,24 @@ Após conectar:
 - A cada 10 mensagens de clientes processadas, o servidor envia heartbeat ao `reference`.
 - O `reference` remove servidores inativos por TTL e retorna horário de referência.
 - Servidores ajustam o relógio físico local por offset com base no horário retornado.
+
+## Parte 5: consistência e replicação
+
+Para resolver a inconsistência causada pelo balanceamento round-robin do broker, a implementação usa replicação ativa por difusão via Pub/Sub.
+
+Funciona assim:
+- quando um servidor aceita uma operação que altera estado persistido, ele grava a mudança localmente e publica um evento de replicação no tópico reservado `__replication__`;
+- todos os servidores assinam esse tópico e aplicam o mesmo evento na própria base SQLite;
+- as escritas usam índices únicos e `INSERT OR IGNORE`, então o mesmo evento pode ser aplicado mais de uma vez sem criar duplicatas.
+
+No projeto, isso replica o estado compartilhado do chat entre servidores para:
+- `logins`
+- `channels`
+- `publications`
+
+Os `request_logs` continuam sendo apenas um log local de observabilidade, porque não fazem parte do estado funcional usado pelos bots.
+
+Não foi necessário alterar o contrato protobuf das mensagens principais. A replicação usa um envelope textual simples com campos codificados em Base64 para evitar ambiguidades entre Python e Java.
 
 ## Como executar
 

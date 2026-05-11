@@ -28,6 +28,9 @@ class ChatDB:
                 """
             )
             conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_logins_replication_key ON logins (username, login_ts_ms)"
+            )
+            conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS channels (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -36,6 +39,9 @@ class ChatDB:
                     created_by TEXT NOT NULL
                 )
                 """
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_replication_key ON channels (name, created_ts_ms, created_by)"
             )
             conn.execute(
                 """
@@ -48,6 +54,9 @@ class ChatDB:
                     published_ts_ms INTEGER NOT NULL
                 )
                 """
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_publications_replication_key ON publications (channel_name, message_text, sent_by, request_ts_ms, published_ts_ms)"
             )
             conn.execute(
                 """
@@ -70,7 +79,7 @@ class ChatDB:
         with self._lock:
             with self._connect() as conn:
                 conn.execute(
-                    "INSERT INTO logins (username, login_ts_ms) VALUES (?, ?)",
+                    "INSERT OR IGNORE INTO logins (username, login_ts_ms) VALUES (?, ?)",
                     (username, ts_ms),
                 )
                 conn.commit()
@@ -83,11 +92,11 @@ class ChatDB:
                 if cur.fetchone() is not None:
                     return False
                 cur.execute(
-                    "INSERT INTO channels (name, created_ts_ms, created_by) VALUES (?, ?, ?)",
+                    "INSERT OR IGNORE INTO channels (name, created_ts_ms, created_by) VALUES (?, ?, ?)",
                     (channel_name, ts_ms, created_by),
                 )
                 conn.commit()
-                return True
+                return cur.rowcount > 0
 
     def list_channels(self) -> List[str]:
         with self._connect() as conn:
@@ -114,7 +123,7 @@ class ChatDB:
                 cur = conn.cursor()
                 cur.execute(
                     """
-                    INSERT INTO publications
+                    INSERT OR IGNORE INTO publications
                     (channel_name, message_text, sent_by, request_ts_ms, published_ts_ms)
                     VALUES (?, ?, ?, ?, ?)
                     """,

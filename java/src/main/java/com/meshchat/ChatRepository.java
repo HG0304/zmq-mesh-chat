@@ -40,6 +40,7 @@ public class ChatRepository {
                     login_ts_ms INTEGER NOT NULL
                 )
             """);
+            stmt.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_logins_replication_key ON logins (username, login_ts_ms)");
             stmt.execute("""
                 CREATE TABLE IF NOT EXISTS channels (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,6 +49,7 @@ public class ChatRepository {
                     created_by TEXT NOT NULL
                 )
             """);
+            stmt.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_replication_key ON channels (name, created_ts_ms, created_by)");
             stmt.execute("""
                 CREATE TABLE IF NOT EXISTS publications (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,6 +60,7 @@ public class ChatRepository {
                     published_ts_ms INTEGER NOT NULL
                 )
             """);
+            stmt.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_publications_replication_key ON publications (channel_name, message_text, sent_by, request_ts_ms, published_ts_ms)");
             stmt.execute("""
                 CREATE TABLE IF NOT EXISTS request_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,7 +81,7 @@ public class ChatRepository {
 
     public synchronized void registerLogin(String username, long tsMs) {
         try (Connection conn = connect();
-             PreparedStatement ps = conn.prepareStatement("INSERT INTO logins (username, login_ts_ms) VALUES (?, ?)")) {
+             PreparedStatement ps = conn.prepareStatement("INSERT OR IGNORE INTO logins (username, login_ts_ms) VALUES (?, ?)")) {
             ps.setString(1, username);
             ps.setLong(2, tsMs);
             ps.executeUpdate();
@@ -98,12 +101,11 @@ public class ChatRepository {
                 }
             }
             try (PreparedStatement insert = conn.prepareStatement(
-                "INSERT INTO channels (name, created_ts_ms, created_by) VALUES (?, ?, ?)")) {
+                "INSERT OR IGNORE INTO channels (name, created_ts_ms, created_by) VALUES (?, ?, ?)")) {
                 insert.setString(1, channelName);
                 insert.setLong(2, tsMs);
                 insert.setString(3, createdBy);
-                insert.executeUpdate();
-                return true;
+                return insert.executeUpdate() > 0;
             }
         } catch (SQLException e) {
             throw new RuntimeException("failed to create channel", e);
@@ -145,7 +147,7 @@ public class ChatRepository {
     ) {
         try (Connection conn = connect();
              PreparedStatement ps = conn.prepareStatement(
-                 "INSERT INTO publications (channel_name, message_text, sent_by, request_ts_ms, published_ts_ms) VALUES (?, ?, ?, ?, ?)")
+                 "INSERT OR IGNORE INTO publications (channel_name, message_text, sent_by, request_ts_ms, published_ts_ms) VALUES (?, ?, ?, ?, ?)")
         ) {
             ps.setString(1, channelName);
             ps.setString(2, messageText);

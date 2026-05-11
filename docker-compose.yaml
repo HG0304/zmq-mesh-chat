@@ -31,6 +31,7 @@ services:
       SERVER_NAME: py-server-1
       BROKER_BACKEND_ADDR: tcp://broker:5556
       PUBSUB_XSUB_ADDR: tcp://pubsub-proxy:5557
+      PUBSUB_XPUB_ADDR: tcp://pubsub-proxy:5558
       REFERENCE_ADDR: tcp://reference:5560
       DB_PATH: /data/chat.db
     volumes:
@@ -49,6 +50,7 @@ services:
       SERVER_NAME: py-server-2
       BROKER_BACKEND_ADDR: tcp://broker:5556
       PUBSUB_XSUB_ADDR: tcp://pubsub-proxy:5557
+      PUBSUB_XPUB_ADDR: tcp://pubsub-proxy:5558
       REFERENCE_ADDR: tcp://reference:5560
       DB_PATH: /data/chat.db
     volumes:
@@ -67,6 +69,7 @@ services:
       SERVER_NAME: java-server-1
       BROKER_BACKEND_ADDR: tcp://broker:5556
       PUBSUB_XSUB_ADDR: tcp://pubsub-proxy:5557
+      PUBSUB_XPUB_ADDR: tcp://pubsub-proxy:5558
       REFERENCE_ADDR: tcp://reference:5560
       DB_PATH: /data/chat.db
     volumes:
@@ -85,6 +88,7 @@ services:
       SERVER_NAME: java-server-2
       BROKER_BACKEND_ADDR: tcp://broker:5556
       PUBSUB_XSUB_ADDR: tcp://pubsub-proxy:5557
+      PUBSUB_XPUB_ADDR: tcp://pubsub-proxy:5558
       REFERENCE_ADDR: tcp://reference:5560
       DB_PATH: /data/chat.db
     volumes:

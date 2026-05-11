@@ -1,3 +1,4 @@
+import base64
 import os
 import re
 import time
@@ -9,6 +10,15 @@ from db import ChatDB
 from generated import chat_pb2
 
 CHANNEL_PATTERN = re.compile(r"^[A-Za-z0-9_-]{3,20}$")
+REPLICATION_TOPIC = "__replication__"
+
+
+def encode_field(value: str) -> str:
+    return base64.b64encode(value.encode("utf-8")).decode("ascii")
+
+
+def decode_field(value: str) -> str:
+    return base64.b64decode(value.encode("ascii")).decode("utf-8")
 
 
 def now_ms(offset_ms: int = 0) -> int:
@@ -35,10 +45,81 @@ def send_reference_request(
     return logical_clock, response
 
 
+def publish_replication_event(
+    pub_socket: zmq.Socket,
+    kind: str,
+    fields: list[str],
+) -> None:
+    payload = "|".join([kind, *fields]).encode("utf-8")
+    pub_socket.send_multipart([REPLICATION_TOPIC.encode("utf-8"), payload])
+
+
+def drain_replication_events(
+    sub_socket: zmq.Socket,
+    db: ChatDB,
+    active_users: Set[str],
+    logical_clock: int,
+) -> int:
+    while True:
+        try:
+            frames = sub_socket.recv_multipart(flags=zmq.DONTWAIT)
+        except zmq.Again:
+            break
+
+        if len(frames) != 2:
+            continue
+
+        _, payload = frames
+        try:
+            parts = payload.decode("utf-8").split("|")
+            kind = parts[0]
+
+            if kind == "LOGIN" and len(parts) == 4:
+                username = decode_field(parts[1])
+                login_ts_ms = int(parts[2])
+                received_clock = int(parts[3])
+                active_users.add(username)
+                db.register_login(username=username, ts_ms=login_ts_ms)
+                logical_clock = sync_with_received(logical_clock, received_clock)
+
+            elif kind == "CREATE_CHANNEL" and len(parts) == 5:
+                channel_name = decode_field(parts[1])
+                created_by = decode_field(parts[2])
+                created_ts_ms = int(parts[3])
+                received_clock = int(parts[4])
+                db.create_channel(
+                    channel_name=channel_name,
+                    created_by=created_by,
+                    ts_ms=created_ts_ms,
+                )
+                logical_clock = sync_with_received(logical_clock, received_clock)
+
+            elif kind == "PUBLICATION" and len(parts) == 7:
+                channel_name = decode_field(parts[1])
+                message_text = decode_field(parts[2])
+                sent_by = decode_field(parts[3])
+                request_ts_ms = int(parts[4])
+                published_ts_ms = int(parts[5])
+                received_clock = int(parts[6])
+                db.save_publication(
+                    channel_name=channel_name,
+                    message_text=message_text,
+                    sent_by=sent_by,
+                    request_ts_ms=request_ts_ms,
+                    published_ts_ms=published_ts_ms,
+                )
+                logical_clock = sync_with_received(logical_clock, received_clock)
+        except Exception:
+            continue
+
+    return logical_clock
+
+
 def main() -> None:
     server_name = os.getenv("SERVER_NAME", "py-server")
     broker_backend_addr = os.getenv("BROKER_BACKEND_ADDR", "tcp://broker:5556")
     pubsub_xsub_addr = os.getenv("PUBSUB_XSUB_ADDR", "tcp://pubsub-proxy:5557")
+    pubsub_xpub_addr = os.getenv("PUBSUB_XPUB_ADDR", "tcp://pubsub-proxy:5558")
     reference_addr = os.getenv("REFERENCE_ADDR", "tcp://reference:5560")
     db_path = os.getenv("DB_PATH", "/data/chat.db")
 
@@ -56,8 +137,16 @@ def main() -> None:
     pub_socket = context.socket(zmq.PUB)
     pub_socket.connect(pubsub_xsub_addr)
 
+    sub_socket = context.socket(zmq.SUB)
+    sub_socket.connect(pubsub_xpub_addr)
+    sub_socket.setsockopt(zmq.SUBSCRIBE, REPLICATION_TOPIC.encode("utf-8"))
+
     ref_socket = context.socket(zmq.REQ)
     ref_socket.connect(reference_addr)
+
+    poller = zmq.Poller()
+    poller.register(rep_socket, zmq.POLLIN)
+    poller.register(sub_socket, zmq.POLLIN)
 
     logical_clock, register_res = send_reference_request(
         ref_socket,
@@ -89,6 +178,14 @@ def main() -> None:
     )
 
     while True:
+        events = dict(poller.poll())
+
+        if sub_socket in events:
+            logical_clock = drain_replication_events(sub_socket, db, active_users, logical_clock)
+
+        if rep_socket not in events:
+            continue
+
         raw = rep_socket.recv()
         req = chat_pb2.ClientRequest()
         req.ParseFromString(raw)
@@ -117,6 +214,15 @@ def main() -> None:
                 db.register_login(username=username, ts_ms=res.timestamp_ms)
                 res.ok = True
                 res.login.username = username
+                publish_replication_event(
+                    pub_socket,
+                    "LOGIN",
+                    [
+                        encode_field(username),
+                        str(res.timestamp_ms),
+                        str(logical_clock),
+                    ],
+                )
 
         elif req.HasField("create_channel"):
             operation = "create_channel"
@@ -139,6 +245,16 @@ def main() -> None:
                 else:
                     res.ok = True
                     res.create_channel.channel_name = channel_name
+                    publish_replication_event(
+                        pub_socket,
+                        "CREATE_CHANNEL",
+                        [
+                            encode_field(channel_name),
+                            encode_field(requested_by),
+                            str(res.timestamp_ms),
+                            str(logical_clock),
+                        ],
+                    )
 
         elif req.HasField("list_channels"):
             operation = "list_channels"
@@ -181,6 +297,18 @@ def main() -> None:
                     sent_by=requested_by,
                     request_ts_ms=req.timestamp_ms,
                     published_ts_ms=publish_ts,
+                )
+                publish_replication_event(
+                    pub_socket,
+                    "PUBLICATION",
+                    [
+                        encode_field(channel_name),
+                        encode_field(message_text),
+                        encode_field(requested_by),
+                        str(req.timestamp_ms),
+                        str(publish_ts),
+                        str(logical_clock),
+                    ],
                 )
                 res.ok = True
                 res.publish_in_channel.channel_name = channel_name

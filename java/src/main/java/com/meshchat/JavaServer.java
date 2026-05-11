@@ -1,6 +1,7 @@
 package com.meshchat;
 
 import java.time.Instant;
+import java.util.Base64;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.regex.Pattern;
@@ -13,11 +14,13 @@ import meshchat.Chat;
 
 public class JavaServer {
     private static final Pattern CHANNEL_PATTERN = Pattern.compile("^[A-Za-z0-9_-]{3,20}$");
+    private static final String REPLICATION_TOPIC = "__replication__";
 
     public void run() {
         String serverName = System.getenv().getOrDefault("SERVER_NAME", "java-server");
         String backendAddr = System.getenv().getOrDefault("BROKER_BACKEND_ADDR", "tcp://broker:5556");
         String pubsubXsubAddr = System.getenv().getOrDefault("PUBSUB_XSUB_ADDR", "tcp://pubsub-proxy:5557");
+        String pubsubXpubAddr = System.getenv().getOrDefault("PUBSUB_XPUB_ADDR", "tcp://pubsub-proxy:5558");
         String referenceAddr = System.getenv().getOrDefault("REFERENCE_ADDR", "tcp://reference:5560");
         String dbPath = System.getenv().getOrDefault("DB_PATH", "/data/chat.db");
 
@@ -36,8 +39,16 @@ public class JavaServer {
             ZMQ.Socket pubSocket = context.createSocket(SocketType.PUB);
             pubSocket.connect(pubsubXsubAddr);
 
+            ZMQ.Socket subSocket = context.createSocket(SocketType.SUB);
+            subSocket.connect(pubsubXpubAddr);
+            subSocket.subscribe(REPLICATION_TOPIC.getBytes(ZMQ.CHARSET));
+
             ZMQ.Socket refSocket = context.createSocket(SocketType.REQ);
             refSocket.connect(referenceAddr);
+
+            ZMQ.Poller poller = context.createPoller(2);
+            int repIndex = poller.register(repSocket, ZMQ.Poller.POLLIN);
+            int subIndex = poller.register(subSocket, ZMQ.Poller.POLLIN);
 
             RefCallResult registerResult = callReference(
                 refSocket,
@@ -75,6 +86,16 @@ public class JavaServer {
             );
 
             while (!Thread.currentThread().isInterrupted()) {
+                poller.poll();
+
+                if (poller.pollin(subIndex)) {
+                    logicalClock = drainReplicationEvents(subSocket, repo, activeUsers, logicalClock);
+                }
+
+                if (!poller.pollin(repIndex)) {
+                    continue;
+                }
+
                 byte[] raw = repSocket.recv(0);
                 if (raw == null) {
                     continue;
@@ -118,9 +139,17 @@ public class JavaServer {
                             res.setErrorMessage("username '" + username + "' already active");
                         } else {
                             activeUsers.add(username);
-                            repo.registerLogin(username, nowMs(clockOffsetMs));
+                            long loginTsMs = nowMs(clockOffsetMs);
+                            repo.registerLogin(username, loginTsMs);
                             res.setOk(true);
                             res.setLogin(Chat.LoginResponse.newBuilder().setUsername(username).build());
+                            publishReplicationEvent(
+                                pubSocket,
+                                "LOGIN",
+                                encodeField(username),
+                                Long.toString(loginTsMs),
+                                Long.toString(logicalClock)
+                            );
                         }
                     }
                     case CREATE_CHANNEL -> {
@@ -133,13 +162,22 @@ public class JavaServer {
                             res.setErrorCode("INVALID_CHANNEL_NAME");
                             res.setErrorMessage("channel must match ^[A-Za-z0-9_-]{3,20}$");
                         } else {
-                            boolean created = repo.createChannel(channelName, requestedBy, nowMs(clockOffsetMs));
+                            long createdTsMs = nowMs(clockOffsetMs);
+                            boolean created = repo.createChannel(channelName, requestedBy, createdTsMs);
                             if (!created) {
                                 res.setErrorCode("CHANNEL_EXISTS");
                                 res.setErrorMessage("channel '" + channelName + "' already exists");
                             } else {
                                 res.setOk(true);
                                 res.setCreateChannel(Chat.CreateChannelResponse.newBuilder().setChannelName(channelName).build());
+                                publishReplicationEvent(
+                                    pubSocket,
+                                    "CREATE_CHANNEL",
+                                    encodeField(channelName),
+                                    encodeField(requestedBy),
+                                    Long.toString(createdTsMs),
+                                    Long.toString(logicalClock)
+                                );
                             }
                         }
                     }
@@ -179,6 +217,16 @@ public class JavaServer {
                             pubSocket.send(event.toByteArray());
 
                             repo.savePublication(channelName, messageText, requestedBy, req.getTimestampMs(), publishTs);
+                            publishReplicationEvent(
+                                pubSocket,
+                                "PUBLICATION",
+                                encodeField(channelName),
+                                encodeField(messageText),
+                                encodeField(requestedBy),
+                                Long.toString(req.getTimestampMs()),
+                                Long.toString(publishTs),
+                                Long.toString(logicalClock)
+                            );
                             res.setOk(true);
                             res.setPublishInChannel(
                                 Chat.PublishInChannelResponse.newBuilder()
@@ -263,6 +311,89 @@ public class JavaServer {
 
     private static String summarize(Chat.ServerResponse res) {
         return "ServerResponse{requestId=" + res.getRequestId() + ", ts=" + res.getTimestampMs() + ", lc=" + res.getLogicalClock() + ", ok=" + res.getOk() + ", errorCode='" + res.getErrorCode() + "', payload=" + res.getPayloadCase() + "}";
+    }
+
+    private static long drainReplicationEvents(ZMQ.Socket subSocket, ChatRepository repo, Set<String> activeUsers, long logicalClock) {
+        while (true) {
+            byte[] topicBytes = subSocket.recv(ZMQ.DONTWAIT);
+            if (topicBytes == null) {
+                break;
+            }
+
+            byte[] payloadBytes = subSocket.recv(0);
+            if (payloadBytes == null) {
+                break;
+            }
+
+            String topic = new String(topicBytes, ZMQ.CHARSET);
+            if (!REPLICATION_TOPIC.equals(topic)) {
+                continue;
+            }
+
+            try {
+                String payload = new String(payloadBytes, ZMQ.CHARSET);
+                String[] parts = payload.split("\\|", -1);
+                String kind = parts[0];
+
+                switch (kind) {
+                    case "LOGIN" -> {
+                        if (parts.length == 4) {
+                            String username = decodeField(parts[1]);
+                            long loginTsMs = Long.parseLong(parts[2]);
+                            long receivedClock = Long.parseLong(parts[3]);
+                            activeUsers.add(username);
+                            repo.registerLogin(username, loginTsMs);
+                            logicalClock = Math.max(logicalClock, receivedClock);
+                        }
+                    }
+                    case "CREATE_CHANNEL" -> {
+                        if (parts.length == 5) {
+                            String channelName = decodeField(parts[1]);
+                            String createdBy = decodeField(parts[2]);
+                            long createdTsMs = Long.parseLong(parts[3]);
+                            long receivedClock = Long.parseLong(parts[4]);
+                            repo.createChannel(channelName, createdBy, createdTsMs);
+                            logicalClock = Math.max(logicalClock, receivedClock);
+                        }
+                    }
+                    case "PUBLICATION" -> {
+                        if (parts.length == 7) {
+                            String channelName = decodeField(parts[1]);
+                            String messageText = decodeField(parts[2]);
+                            String sentBy = decodeField(parts[3]);
+                            long requestTsMs = Long.parseLong(parts[4]);
+                            long publishedTsMs = Long.parseLong(parts[5]);
+                            long receivedClock = Long.parseLong(parts[6]);
+                            repo.savePublication(channelName, messageText, sentBy, requestTsMs, publishedTsMs);
+                            logicalClock = Math.max(logicalClock, receivedClock);
+                        }
+                    }
+                    default -> {
+                    }
+                }
+            } catch (Exception e) {
+                System.err.printf("[replication] failed to apply event: %s%n", e.getMessage());
+            }
+        }
+
+        return logicalClock;
+    }
+
+    private static void publishReplicationEvent(ZMQ.Socket pubSocket, String kind, String... fields) {
+        StringBuilder payload = new StringBuilder(kind);
+        for (String field : fields) {
+            payload.append('|').append(field);
+        }
+        pubSocket.sendMore(REPLICATION_TOPIC);
+        pubSocket.send(payload.toString());
+    }
+
+    private static String encodeField(String value) {
+        return Base64.getEncoder().encodeToString(value.getBytes(ZMQ.CHARSET));
+    }
+
+    private static String decodeField(String value) {
+        return new String(Base64.getDecoder().decode(value), ZMQ.CHARSET);
     }
 
     private static final class RefCallResult {
