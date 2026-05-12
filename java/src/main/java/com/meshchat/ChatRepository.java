@@ -101,7 +101,7 @@ public class ChatRepository {
                 }
             }
             try (PreparedStatement insert = conn.prepareStatement(
-                "INSERT OR IGNORE INTO channels (name, created_ts_ms, created_by) VALUES (?, ?, ?)")) {
+                "INSERT OR IGNORE INTO channels (name, created_ts_ms, created_by) VALUES (?, ?, ?)") ) {
                 insert.setString(1, channelName);
                 insert.setLong(2, tsMs);
                 insert.setString(3, createdBy);
