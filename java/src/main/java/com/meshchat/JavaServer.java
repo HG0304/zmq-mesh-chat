@@ -494,31 +494,57 @@ public class JavaServer {
         }
 
         if ("CLOCK".equals(parts[0])) {
-            long receivedClock = parts.length > 2 ? parseLongSafe(parts[2]) : 0;
-            state.logicalClock = Math.max(state.logicalClock, receivedClock);
-            state.logicalClock++;
-            if (serverName.equals(state.coordinatorName)) {
-                syncRepSocket.send(encodeControlMessage("TIME", String.valueOf(nowMs(state.clockOffsetMs)), String.valueOf(state.logicalClock)));
-            } else {
-                syncRepSocket.send(encodeControlMessage("NOT_COORDINATOR", state.coordinatorName, String.valueOf(state.logicalClock)));
-            }
+            handleClockSyncMessage(syncRepSocket, serverName, state, parts);
             return;
         }
 
         if ("ELECTION".equals(parts[0])) {
-            long receivedClock = parts.length > 3 ? parseLongSafe(parts[3]) : 0;
-            state.logicalClock = Math.max(state.logicalClock, receivedClock);
-            state.logicalClock++;
-            syncRepSocket.send(encodeControlMessage("OK", String.valueOf(state.logicalClock)));
-
-            int senderRank = parts.length > 2 ? (int) parseLongSafe(parts[2]) : 0;
-            if (state.serverRank > senderRank) {
-                startElectionCb.run();
-            }
+            handleElectionSyncMessage(syncRepSocket, state, parts, startElectionCb);
             return;
         }
 
         syncRepSocket.send(encodeControlMessage("ERROR", "0"));
+    }
+
+    private static void handleClockSyncMessage(
+        ZMQ.Socket syncRepSocket,
+        String serverName,
+        ServerState state,
+        String[] parts
+    ) {
+        long receivedClock = parts.length > 2 ? parseLongSafe(parts[2]) : 0;
+        long senderTimeMs = parts.length > 3 ? parseLongSafe(parts[3]) : 0;
+        state.logicalClock = Math.max(state.logicalClock, receivedClock);
+        state.logicalClock++;
+        if (serverName.equals(state.coordinatorName)) {
+            long coordinatorTimeMs = nowMs(state.clockOffsetMs);
+            long berkeleyTimeMs = computeBerkeleyTime(
+                state,
+                parts.length > 1 ? parts[1] : "",
+                senderTimeMs > 0 ? senderTimeMs : coordinatorTimeMs,
+                coordinatorTimeMs
+            );
+            syncRepSocket.send(encodeControlMessage("TIME", String.valueOf(berkeleyTimeMs), String.valueOf(state.logicalClock)));
+        } else {
+            syncRepSocket.send(encodeControlMessage("NOT_COORDINATOR", state.coordinatorName, String.valueOf(state.logicalClock)));
+        }
+    }
+
+    private static void handleElectionSyncMessage(
+        ZMQ.Socket syncRepSocket,
+        ServerState state,
+        String[] parts,
+        Runnable startElectionCb
+    ) {
+        long receivedClock = parts.length > 3 ? parseLongSafe(parts[3]) : 0;
+        state.logicalClock = Math.max(state.logicalClock, receivedClock);
+        state.logicalClock++;
+        syncRepSocket.send(encodeControlMessage("OK", String.valueOf(state.logicalClock)));
+
+        int senderRank = parts.length > 2 ? (int) parseLongSafe(parts[2]) : 0;
+        if (state.serverRank > senderRank) {
+            startElectionCb.run();
+        }
     }
 
     private static void maybeSendHeartbeat(ZMQ.Socket refSocket, String serverName, ServerState state) {
@@ -653,7 +679,14 @@ public class JavaServer {
         socket.connect(String.format(syncConnectTemplate, state.coordinatorName));
 
         state.logicalClock++;
-        socket.send(encodeControlMessage("CLOCK", serverName, String.valueOf(state.logicalClock)));
+        socket.send(
+            encodeControlMessage(
+                "CLOCK",
+                serverName,
+                String.valueOf(state.logicalClock),
+                String.valueOf(nowMs(state.clockOffsetMs))
+            )
+        );
         String reply = socket.recvStr();
         socket.close();
         if (reply == null) {
@@ -743,6 +776,24 @@ public class JavaServer {
     private static long nowMs(long offsetMs) {
         return Instant.now().toEpochMilli() + offsetMs;
     }
+
+    private static long computeBerkeleyTime(
+        ServerState state,
+        String senderName,
+        long senderTimeMs,
+        long coordinatorTimeMs
+    ) {
+        if (senderName != null && !senderName.isBlank()) {
+            state.lastReportedTimes.put(senderName, senderTimeMs);
+        }
+        long sum = coordinatorTimeMs;
+        int count = 1;
+        for (long value : state.lastReportedTimes.values()) {
+            sum += value;
+            count++;
+        }
+        return count == 0 ? coordinatorTimeMs : Math.round((double) sum / count);
+    }
     private static final class RefCallResult {
         private final long logicalClock;
         private final Chat.ReferenceResponse response;
@@ -770,6 +821,7 @@ public class JavaServer {
         private int receivedClientMessages = 0;
         private String coordinatorName = "";
         private Map<String, Integer> knownRanks = new HashMap<>();
+        private Map<String, Long> lastReportedTimes = new HashMap<>();
     }
 
     private static final class ClientHandlingInfo {

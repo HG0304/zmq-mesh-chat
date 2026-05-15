@@ -26,6 +26,7 @@ class ServerState:
     received_client_messages: int
     coordinator_name: str
     known_ranks: dict[str, int]
+    last_reported_times: dict[str, int]
 
 
 def now_ms(offset_ms: int = 0) -> int:
@@ -93,6 +94,7 @@ def request_clock_from_coordinator(
     coordinator_name: str,
     sender_name: str,
     logical_clock: int,
+    clock_offset_ms: int,
     timeout_ms: int,
     connect_template: str,
 ) -> tuple[int, int | None]:
@@ -106,7 +108,14 @@ def request_clock_from_coordinator(
     socket.connect(connect_template.format(server_name=coordinator_name))
 
     logical_clock += 1
-    socket.send(encode_control_message("CLOCK", sender_name, str(logical_clock)))
+    socket.send(
+        encode_control_message(
+            "CLOCK",
+            sender_name,
+            str(logical_clock),
+            str(now_ms(clock_offset_ms)),
+        )
+    )
 
     try:
         raw = socket.recv()
@@ -131,6 +140,21 @@ def request_clock_from_coordinator(
         return logical_clock, int(payload)
     except ValueError:
         return logical_clock, None
+
+
+def compute_berkeley_time(
+    state: ServerState,
+    sender_name: str,
+    sender_time_ms: int,
+    coordinator_time_ms: int,
+) -> int:
+    if sender_name:
+        state.last_reported_times[sender_name] = sender_time_ms
+    times = [coordinator_time_ms]
+    times.extend(state.last_reported_times.values())
+    if not times:
+        return coordinator_time_ms
+    return int(sum(times) / len(times))
 
 
 def send_election_request(
@@ -237,6 +261,7 @@ def handle_sync_request(
     clock_offset_ms: int,
     logical_clock: int,
     server_rank: int,
+    state: ServerState,
     start_election_cb,
 ) -> tuple[int, str]:
     parts = decode_control_message(raw)
@@ -250,6 +275,7 @@ def handle_sync_request(
             coordinator_name,
             clock_offset_ms,
             logical_clock,
+            state,
         )
 
     if msg_type == "ELECTION":
@@ -273,17 +299,26 @@ def handle_clock_request(
     coordinator_name: str,
     clock_offset_ms: int,
     logical_clock: int,
+    state: ServerState,
 ) -> tuple[int, str]:
     sender_name = parts[1] if len(parts) > 1 else ""
     received_clock = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+    sender_time_ms = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
     logical_clock = sync_with_received(logical_clock, received_clock)
     logical_clock += 1
 
     if is_coordinator(server_name, coordinator_name):
+        coordinator_time_ms = now_ms(clock_offset_ms)
+        berkeley_time_ms = compute_berkeley_time(
+            state,
+            sender_name,
+            sender_time_ms or coordinator_time_ms,
+            coordinator_time_ms,
+        )
         sync_rep_socket.send(
             encode_control_message(
                 "TIME",
-                str(now_ms(clock_offset_ms)),
+                str(berkeley_time_ms),
                 str(logical_clock),
             )
         )
@@ -604,6 +639,7 @@ def process_sync_event(
         state.clock_offset_ms,
         state.logical_clock,
         state.server_rank,
+        state,
         start_election_cb,
     )
 
@@ -690,6 +726,7 @@ def maybe_sync_clock(
         state.coordinator_name,
         server_name,
         state.logical_clock,
+        state.clock_offset_ms,
         server_sync_timeout_ms,
         server_sync_connect_template,
     )
@@ -724,6 +761,7 @@ def run_server() -> None:
         received_client_messages=0,
         coordinator_name="",
         known_ranks={},
+        last_reported_times={},
     )
 
     context = zmq.Context()
